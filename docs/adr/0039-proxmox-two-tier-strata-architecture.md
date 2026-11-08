@@ -1,7 +1,7 @@
 # ADR-0039: Proxmox VE Two-Tier Split (GPU LXC + Docker App VM) & Strata Primary Architecture
 
-- **Status:** Accepted (Phase 1 in progress)
-- **Date:** 2026-11-07
+- **Status:** Accepted (Phase 1 & Phase 2 Complete)
+- **Date:** 2026-11-08 (Updated)
 - **Related:** [ADR-0006](0006-hybrid-deployment-model.md) (hybrid deploy), [ADR-0032](0032-qwen3.8-flash-next-strata-evaluation.md) / [ADR-0033](0033-flash-next-strata-in-llama-swap.md) (Strata engine)
 
 ## Context
@@ -42,3 +42,9 @@ This fork adapts the reference bare-metal `/srv/ai` server architecture to a Pro
 ## Consequences
 - Reclaims 114 GB from the ZFS root pool (`rpool`) and unlocks the 44 GiB Linux page cache for Strata's 36 GiB `experts.bin` file tier.
 - Isolates Docker Compose on a standard KVM kernel (VM 101) with native `overlay2` while preserving near-zero-overhead GPU execution in CT 100.
+
+## Verified (2026-11-08)
+- **KVM Virtualization:** AMD SVM enabled in 5800X3D BIOS; VM 101 running Debian 13 (`6.12.115-cloud-amd64`) with 3.5 GB static RAM and 2 vCPUs (`cpu: host`).
+- **Docker Compose Stack:** LiteLLM (`:4000`), Open WebUI (`:3000`), SearXNG (`127.0.0.1:8888`), `mcpo` (`:8000`), `autoheal`, and `docker-socket-proxy` all healthy and running.
+- **End-to-End Inference:** LiteLLM gateway routes client chat completions over private bridge (`192.168.1.12:4000` -> `192.168.1.11:8080`) to Strata, achieving 30.2 tok/s prompt prefill, 22.2 tok/s generation, and 100% DFlash2 speculative draft acceptance on RTX 3080.
+- **Web Interface:** Open WebUI accessible on `http://192.168.1.12:3000` with models `coding`, `chat`, `flash`, and `qwen3.8-flash-next-iq3_xxs`.
