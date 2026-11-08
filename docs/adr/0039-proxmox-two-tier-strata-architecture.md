@@ -53,4 +53,4 @@ This fork adapts the reference bare-metal `/srv/ai` server architecture to a Pro
   - ComfyUI `free_gpu.py` middleware catches generation requests (`/prompt`), issuing `POST /unload` to Strata (`:8080`), freeing VRAM from 11.4 GB to 1 MiB in <1s.
   - Strata `before_load` hook triggers `POST /free` to ComfyUI (`:8188`) prior to loading.
   - Verified live: Executed `generate_image` via mcpo in 2.87 seconds, followed immediately by LLM text generation through LiteLLM (38 tok/s prompt, 32.5 tok/s decode, 85.5% DFlash2 acceptance) without manual intervention or OOM.
-- **File Management:** Standalone Filebrowser v2.63.23 active on CT 100 (`http://192.168.1.11:8083`) serving `/srv/ai` directly.
+- **File Management:** Standalone FileBrowser Quantum (`gtsteffaniak/filebrowser` v2.0.2-stable, active community successor) deployed on CT 100 (`http://192.168.1.11:8083`) via `filebrowser.service` serving `/srv/ai` directly with SQLite backend, 2FA support, and legacy shell-exec vulnerabilities removed.
