@@ -69,6 +69,8 @@ import time
 log = logging.getLogger("free_gpu")
 
 LLAMASWAP_URL = os.environ.get("LLAMASWAP_URL", "http://127.0.0.1:9090").rstrip("/")
+STRATA_URL = os.environ.get("STRATA_URL", "").rstrip("/")
+STRATA_API_KEY = os.environ.get("STRATA_API_KEY", "").strip()
 TRIGGER_PATHS = tuple(
     p.strip() for p in os.environ.get("FREE_GPU_PATHS", "/prompt,/api/prompt").split(",") if p.strip()
 )
@@ -150,35 +152,30 @@ async def _targets_still_live(targets):
         return False  # can't tell — don't hang the generation on this
 
 
-async def _wait_for_release(targets, free_before):
-    """Block until the card ComfyUI needs is actually free, or WAIT_SECS elapses.
-
-    llama-swap's unload endpoint returns as soon as it *signals* the model to stop;
-    the llama.cpp subprocess then takes a few seconds to exit and hand VRAM back to
-    the driver. Proceeding immediately races that teardown and OOMs (the card still
-    holds the ~20 GB LLM). We wait until BOTH: llama-swap no longer lists the target
-    as live, AND the pinned GPU has handed back at least WAIT_RELEASE_MB (vs. the
-    reading taken before unloading). If we can't read VRAM, we fall back to the
-    /running signal plus a short settle.
-    """
-    if WAIT_SECS <= 0 or not targets:
+async def _wait_for_release(targets, free_before, is_strata=False):
+    """Block until the card ComfyUI needs is actually free, or WAIT_SECS elapses."""
+    if WAIT_SECS <= 0 or (not targets and not is_strata):
         return
     start = time.monotonic()
     while time.monotonic() - start < WAIT_SECS:
-        gone = not await _targets_still_live(targets)
+        gone = True if is_strata else not await _targets_still_live(targets)
         free_now = await _gpu_free_mb()
-        if free_now is None:
-            # No VRAM telemetry — rely on the unload signal plus a brief settle so
-            # the subprocess has a moment to release before we start.
-            if gone:
-                await asyncio.sleep(2)
-                log.info("free_gpu: unload signalled (no VRAM telemetry); proceeding")
+        if free_now is not None:
+            if free_before is not None and free_now - free_before >= WAIT_RELEASE_MB:
+                log.info(
+                    "free_gpu: card freed in %.1fs (free %s→%s MB)",
+                    time.monotonic() - start, free_before, free_now,
+                )
                 return
-        elif gone and (free_before is None or free_now - free_before >= WAIT_RELEASE_MB):
-            log.info(
-                "free_gpu: card freed in %.1fs (free %s→%s MB)",
-                time.monotonic() - start, free_before, free_now,
-            )
+            if free_now >= 10000:
+                log.info(
+                    "free_gpu: card confirmed free in %.1fs (%s MB free)",
+                    time.monotonic() - start, free_now,
+                )
+                return
+        elif gone:
+            await asyncio.sleep(2)
+            log.info("free_gpu: unload signalled (no VRAM telemetry); proceeding")
             return
         await asyncio.sleep(0.5)
     log.warning(
@@ -188,51 +185,64 @@ async def _wait_for_release(targets, free_before):
 
 
 async def _free_gpu():
-    """Unload only the llama-swap model(s) squatting on ComfyUI's card.
-
-    Keeps FREE_GPU_KEEP models (default chat + small, on idx2/idx0) resident and
-    unloads everything else running (idx1 `coding`, or a split `big`/`coder-next`)
-    via llama-swap's per-model endpoint. Ignores failures — never blocks a run.
-    """
+    """Unload LLM models (Strata or llama-swap) squatting on ComfyUI's card."""
     import aiohttp
     try:
         async with aiohttp.ClientSession() as s:
-            # Inspect what's loaded; only unload models NOT in the keep-list.
-            try:
-                async with s.get(f"{LLAMASWAP_URL}/running", timeout=aiohttp.ClientTimeout(total=3)) as r:
-                    data = await r.json()
-                    running = [m for m in data.get("running", []) if m.get("state") in ("ready", "loading", "starting")]
-            except Exception:
-                return  # llama-swap unreachable — nothing to free
-            targets = [
-                m["model"] for m in running
-                if m.get("model") and m["model"] not in KEEP_MODELS
-            ]
-            if not targets:
-                log.info(
-                    "free_gpu: nothing to unload (running=%s, keeping=%s)",
-                    [m.get("model") for m in running], sorted(KEEP_MODELS),
-                )
-                return
-            # Snapshot free VRAM before unloading so _wait_for_release can tell when
-            # the card has actually handed the LLM's memory back.
             free_before = await _gpu_free_mb()
-            log.info(
-                "free_gpu: unloading %s before generation (keeping %s)",
-                targets, sorted(KEEP_MODELS),
-            )
-            for name in targets:
+
+            # Handle Strata unload if configured
+            if STRATA_URL:
+                headers = {"Content-Type": "application/json"}
+                if STRATA_API_KEY:
+                    headers["Authorization"] = f"Bearer {STRATA_API_KEY}"
                 try:
+                    log.info("free_gpu: requesting Strata unload at %s", STRATA_URL)
                     async with s.post(
-                        f"{LLAMASWAP_URL}/api/models/unload/{name}",
-                        timeout=aiohttp.ClientTimeout(total=30),
+                        f"{STRATA_URL}/unload",
+                        headers=headers,
+                        json={},
+                        timeout=aiohttp.ClientTimeout(total=10),
                     ) as r:
-                        await r.read()
+                        if r.status in (200, 204):
+                            log.info("free_gpu: Strata unload accepted")
+                        else:
+                            log.warning("free_gpu: Strata unload status %d", r.status)
                 except Exception as e:
-                    log.warning("free_gpu: unload of %s failed (continuing): %s", name, e)
-            # Wait for the teardown to actually release VRAM before returning, so the
-            # generation doesn't start on a still-occupied card and OOM.
-            await _wait_for_release(targets, free_before)
+                    log.warning("free_gpu: Strata unload request failed: %s", e)
+                await _wait_for_release([], free_before, is_strata=True)
+
+            # Inspect what's loaded in llama-swap; only unload models NOT in the keep-list.
+            if LLAMASWAP_URL:
+                try:
+                    async with s.get(f"{LLAMASWAP_URL}/running", timeout=aiohttp.ClientTimeout(total=3)) as r:
+                        data = await r.json()
+                        running = [m for m in data.get("running", []) if m.get("state") in ("ready", "loading", "starting")]
+                except Exception:
+                    return  # llama-swap unreachable
+
+                targets = [
+                    m["model"] for m in running
+                    if m.get("model") and m["model"] not in KEEP_MODELS
+                ]
+                if not targets:
+                    return
+
+                free_before = await _gpu_free_mb()
+                log.info(
+                    "free_gpu: unloading %s before generation (keeping %s)",
+                    targets, sorted(KEEP_MODELS),
+                )
+                for name in targets:
+                    try:
+                        async with s.post(
+                            f"{LLAMASWAP_URL}/api/models/unload/{name}",
+                            timeout=aiohttp.ClientTimeout(total=30),
+                        ) as r:
+                            await r.read()
+                    except Exception as e:
+                        log.warning("free_gpu: unload of %s failed (continuing): %s", name, e)
+                await _wait_for_release(targets, free_before)
     except Exception as e:  # never block a generation because freeing failed
         log.warning("free_gpu: unload attempt failed (continuing anyway): %s", e)
 
@@ -252,13 +262,34 @@ def _free_comfyui_vram():
 
 
 async def _restore_models():
-    """Warm FREE_GPU_RESTORE model(s) back onto their card(s) via llama-swap, so
+    """Warm FREE_GPU_RESTORE model(s) back onto their card(s) via Strata or llama-swap, so
     the box returns to its daily resident state after an image session."""
     if not RESTORE_MODELS:
         return
     import aiohttp
     async with aiohttp.ClientSession() as s:
+        if "strata" in RESTORE_MODELS and STRATA_URL:
+            headers = {"Content-Type": "application/json"}
+            if STRATA_API_KEY:
+                headers["Authorization"] = f"Bearer {STRATA_API_KEY}"
+            try:
+                log.info("free_gpu: warming Strata model back at %s", STRATA_URL)
+                async with s.post(
+                    f"{STRATA_URL}/load",
+                    headers=headers,
+                    json={},
+                    timeout=aiohttp.ClientTimeout(total=60),
+                ) as r:
+                    if r.status in (200, 204):
+                        log.info("free_gpu: Strata model warmed back up")
+                    else:
+                        log.warning("free_gpu: Strata load returned status %d", r.status)
+            except Exception as e:
+                log.warning("free_gpu: failed to warm Strata (continuing): %s", e)
+
         for name in RESTORE_MODELS:
+            if name == "strata":
+                continue
             try:
                 body = {
                     "model": name,

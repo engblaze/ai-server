@@ -1,6 +1,6 @@
 # ADR-0039: Proxmox VE Two-Tier Split (GPU LXC + Docker App VM) & Strata Primary Architecture
 
-- **Status:** Accepted (Phase 1 & Phase 2 Complete)
+- **Status:** Accepted (Phases 1, 2, and 3 Complete)
 - **Date:** 2026-11-08 (Updated)
 - **Related:** [ADR-0006](0006-hybrid-deployment-model.md) (hybrid deploy), [ADR-0032](0032-qwen3.8-flash-next-strata-evaluation.md) / [ADR-0033](0033-flash-next-strata-in-llama-swap.md) (Strata engine)
 
@@ -48,3 +48,9 @@ This fork adapts the reference bare-metal `/srv/ai` server architecture to a Pro
 - **Docker Compose Stack:** LiteLLM (`:4000`), Open WebUI (`:3000`), SearXNG (`127.0.0.1:8888`), `mcpo` (`:8000`), `autoheal`, and `docker-socket-proxy` all healthy and running.
 - **End-to-End Inference:** LiteLLM gateway routes client chat completions over private bridge (`192.168.1.12:4000` -> `192.168.1.11:8080`) to Strata, achieving 30.2 tok/s prompt prefill, 22.2 tok/s generation, and 100% DFlash2 speculative draft acceptance on RTX 3080.
 - **Web Interface:** Open WebUI accessible on `http://192.168.1.12:3000` with models `coding`, `chat`, `flash`, and `qwen3.8-flash-next-iq3_xxs`.
+- **Generative Media (ComfyUI & MCP Bridge):** ComfyUI running natively on CT 100 (`http://192.168.1.11:8188`) with hermetic Python 3.12 venv, PyTorch `2.6.0+cu124`, ComfyUI-Manager, and models stored on secondary NVMe (`/srv/ai/models/comfyui-models`). Bridged by `comfyui-mcp` (`:9000`) and mounted into `mcpo` (`:8000`) on VM 101, exposing 18 image generation workflows and asset tools to Open WebUI.
+- **Symmetric GPU Preemption (RTX 3080 12GB):**
+  - ComfyUI `free_gpu.py` middleware catches generation requests (`/prompt`), issuing `POST /unload` to Strata (`:8080`), freeing VRAM from 11.4 GB to 1 MiB in <1s.
+  - Strata `before_load` hook triggers `POST /free` to ComfyUI (`:8188`) prior to loading.
+  - Verified live: Executed `generate_image` via mcpo in 2.87 seconds, followed immediately by LLM text generation through LiteLLM (38 tok/s prompt, 32.5 tok/s decode, 85.5% DFlash2 acceptance) without manual intervention or OOM.
+- **File Management:** Standalone Filebrowser v2.63.23 active on CT 100 (`http://192.168.1.11:8083`) serving `/srv/ai` directly.
